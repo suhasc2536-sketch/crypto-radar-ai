@@ -2,123 +2,212 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-from datetime import datetime, timezone
-from pathlib import Path
+import plotly.express as px
 
-st.set_page_config(page_title="Crypto Radar AI", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="Crypto Radar AI", page_icon="ðŸ”¥", layout="wide")
 
-BINANCE = "https://api.binance.com"
-DATA_DIR = Path("data")
-DATA_DIR.mkdir(exist_ok=True)
+st.title("ðŸ”¥ Crypto Radar AI")
+st.caption("Research dashboard â€” signals are experimental and do not guarantee future price moves.")
 
-@st.cache_data(ttl=30)
-def get_ticker(symbol):
-    r = requests.get(f"{BINANCE}/api/v3/ticker/24hr", params={"symbol": symbol}, timeout=10)
+# Coinbase Exchange public API is used instead of Binance because Binance can return
+# HTTP 451 from some cloud hosting locations.
+COINBASE_BASE = "https://api.exchange.coinbase.com"
+
+PRODUCTS = {
+    "BTCUSDT": "BTC-USD",
+    "ETHUSDT": "ETH-USD",
+    "SOLUSDT": "SOL-USD",
+    "DOGEUSDT": "DOGE-USD",
+}
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_ticker(product):
+    url = f"{COINBASE_BASE}/products/{product}/ticker"
+    r = requests.get(url, timeout=15, headers={"User-Agent": "CryptoRadarAI/1.0"})
     r.raise_for_status()
     return r.json()
 
-@st.cache_data(ttl=60)
-def get_klines(symbol, interval="1h", limit=500):
-    r = requests.get(f"{BINANCE}/api/v3/klines",
-                     params={"symbol": symbol, "interval": interval, "limit": limit},
-                     timeout=15)
+@st.cache_data(ttl=60, show_spinner=False)
+def get_candles(product, granularity=3600):
+    url = f"{COINBASE_BASE}/products/{product}/candles"
+    params = {"granularity": granularity}
+    r = requests.get(url, params=params, timeout=15,
+                     headers={"User-Agent": "CryptoRadarAI/1.0"})
     r.raise_for_status()
+
     raw = r.json()
-    cols = ["open_time","open","high","low","close","volume","close_time",
-            "quote_volume","trades","taker_buy_base","taker_buy_quote","ignore"]
-    df = pd.DataFrame(raw, columns=cols)
-    for c in ["open","high","low","close","volume","quote_volume"]:
+    if not raw:
+        return pd.DataFrame()
+
+    # Coinbase returns: time, low, high, open, close, volume
+    df = pd.DataFrame(
+        raw, columns=["time", "low", "high", "open", "close", "volume"]
+    )
+    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+    for c in ["open", "high", "low", "close", "volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    return df[["time","open","high","low","close","volume","quote_volume","trades"]]
+
+    return df.sort_values("time").reset_index(drop=True)
 
 def rsi(series, period=14):
     delta = series.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1/period, adjust=False).mean()
-    rs = gain / loss.replace(0, np.nan)
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
-def score_market(df):
-    x = df.copy()
-    x["ema_fast"] = x["close"].ewm(span=12, adjust=False).mean()
-    x["ema_slow"] = x["close"].ewm(span=26, adjust=False).mean()
-    x["rsi"] = rsi(x["close"])
-    x["ret_24h"] = x["close"].pct_change(24)
-    x["vol_ratio"] = x["volume"] / x["volume"].rolling(24).mean()
-    x["high_48"] = x["high"].rolling(48).max().shift(1)
-    last = x.iloc[-1]
+def radar_score(df):
+    if len(df) < 60:
+        return 0, []
 
-    score = 50
-    reasons = []
-    if last["ema_fast"] > last["ema_slow"]:
-        score += 12; reasons.append("EMA trend bullish")
+    close = df["close"]
+    volume = df["volume"]
+
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    current_rsi = float(rsi(close).iloc[-1])
+
+    vol_ma = volume.rolling(20).mean().iloc[-1]
+    vol_ratio = float(volume.iloc[-1] / vol_ma) if vol_ma and not pd.isna(vol_ma) else 1.0
+
+    previous_high = close.rolling(48).max().shift(1).iloc[-1]
+    breakout = bool(close.iloc[-1] > previous_high) if not pd.isna(previous_high) else False
+
+    score = 0
+    signals = []
+
+    if ema12.iloc[-1] > ema26.iloc[-1]:
+        score += 30
+        signals.append("EMA bullish")
     else:
-        score -= 12
-    if last["vol_ratio"] > 1.5:
-        score += 15; reasons.append(f"Volume spike {last['vol_ratio']:.1f}x")
-    elif last["vol_ratio"] > 1.1:
-        score += 7; reasons.append("Volume above average")
-    if 55 <= last["rsi"] <= 72:
-        score += 10; reasons.append("Healthy momentum RSI")
-    elif last["rsi"] > 78:
-        score -= 8; reasons.append("Overbought risk")
-    if pd.notna(last["high_48"]) and last["close"] > last["high_48"]:
-        score += 13; reasons.append("48-bar breakout")
-    if pd.notna(last["ret_24h"]):
-        if last["ret_24h"] > 0.05:
-            score += 5; reasons.append("Strong 24h momentum")
-        elif last["ret_24h"] < -0.05:
-            score -= 8; reasons.append("Sharp 24h decline")
-    return int(np.clip(score, 0, 100)), reasons, x
+        signals.append("EMA bearish")
 
-st.title("⚡ Crypto Radar AI")
-st.caption("Research / paper-trading dashboard — not a guarantee of future returns.")
+    if 50 <= current_rsi <= 70:
+        score += 20
+        signals.append("RSI healthy")
+    elif current_rsi > 70:
+        score += 8
+        signals.append("RSI hot")
+    else:
+        signals.append("RSI weak")
 
-symbols = st.multiselect(
-    "Markets",
-    ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","DOGEUSDT","ADAUSDT","AVAXUSDT","LINKUSDT","SUIUSDT"],
-    default=["BTCUSDT","ETHUSDT","SOLUSDT","DOGEUSDT"]
+    if vol_ratio >= 1.5:
+        score += 25
+        signals.append("Volume surge")
+    elif vol_ratio >= 1.15:
+        score += 12
+        signals.append("Volume rising")
+
+    if breakout:
+        score += 25
+        signals.append("48h breakout")
+
+    return min(score, 100), signals
+
+# ---------------- Dashboard ----------------
+
+rows = []
+data_by_symbol = {}
+
+for symbol, product in PRODUCTS.items():
+    try:
+        ticker = get_ticker(product)
+        df = get_candles(product)
+
+        if df.empty:
+            raise ValueError("No candle data returned")
+
+        score, signals = radar_score(df)
+
+        price = float(ticker["price"])
+        volume_24h = float(ticker.get("volume", 0))
+
+        # Approximate 24h percentage from the candle data when enough history exists.
+        pct_24h = np.nan
+        if len(df) >= 25:
+            old = float(df["close"].iloc[-25])
+            if old:
+                pct_24h = (price / old - 1) * 100
+
+        rows.append({
+            "Symbol": symbol,
+            "Price": price,
+            "24h Volume": volume_24h,
+            "24h %": pct_24h,
+            "Radar Score": score,
+            "Signals": ", ".join(signals),
+        })
+        data_by_symbol[symbol] = df
+
+    except Exception as e:
+        rows.append({
+            "Symbol": symbol,
+            "Price": np.nan,
+            "24h Volume": np.nan,
+            "24h %": np.nan,
+            "Radar Score": 0,
+            "Signals": f"Data error: {type(e).__name__}",
+        })
+
+out = pd.DataFrame(rows)
+st.subheader("Opportunity Radar")
+st.dataframe(
+    out,
+    use_container_width=True,
+    hide_index=True,
+    column_config={
+        "Price": st.column_config.NumberColumn(format="$%.6f"),
+        "24h Volume": st.column_config.NumberColumn(format="$%.0f"),
+        "24h %": st.column_config.NumberColumn(format="%.2f%%"),
+        "Radar Score": st.column_config.ProgressColumn(min_value=0, max_value=100),
+    },
 )
-
-if st.button("🔄 Scan now", type="primary") or symbols:
-    rows = []
-    for s in symbols:
-        try:
-            ticker = get_ticker(s)
-            df = get_klines(s)
-            score, reasons, x = score_market(df)
-            rows.append({
-                "Symbol": s,
-                "Price": float(ticker["lastPrice"]),
-                "24h %": float(ticker["priceChangePercent"]),
-                "24h Volume": float(ticker["quoteVolume"]),
-                "Radar Score": score,
-                "Signals": " • ".join(reasons) if reasons else "No strong signal"
-            })
-        except Exception as e:
-            rows.append({"Symbol": s, "Price": np.nan, "24h %": np.nan,
-                         "24h Volume": np.nan, "Radar Score": 0, "Signals": str(e)})
-
-    out = pd.DataFrame(rows).sort_values("Radar Score", ascending=False)
-    st.subheader("🔥 Opportunity Radar")
-    st.dataframe(out, use_container_width=True, hide_index=True)
-
-    if not out.empty:
-        top = out.iloc[0]["Symbol"]
-        st.subheader(f"📈 {top} chart")
-        chart_df = get_klines(top, "1h", 300).set_index("time")
-        st.line_chart(chart_df["close"])
 
 st.divider()
-st.subheader("📰 News integration")
+
+symbol = st.selectbox("Choose a coin", list(PRODUCTS.keys()))
+
+if symbol in data_by_symbol:
+    df = data_by_symbol[symbol].copy()
+    df["EMA12"] = df["close"].ewm(span=12, adjust=False).mean()
+    df["EMA26"] = df["close"].ewm(span=26, adjust=False).mean()
+    df["RSI"] = rsi(df["close"])
+
+    st.subheader(f"ðŸ“ˆ {symbol} chart")
+
+    chart_df = df.tail(120).copy()
+    fig = px.line(
+        chart_df,
+        x="time",
+        y=["close", "EMA12", "EMA26"],
+        labels={"value": "Price (USD)", "time": "Time", "variable": ""},
+    )
+    fig.update_layout(legend_title_text="")
+    st.plotly_chart(fig, use_container_width=True)
+
+    latest_score, latest_signals = radar_score(df)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Radar Score", f"{latest_score}/100")
+    c2.metric("RSI", f"{df['RSI'].iloc[-1]:.1f}")
+    vol_ma = df["volume"].rolling(20).mean().iloc[-1]
+    vol_ratio = df["volume"].iloc[-1] / vol_ma if vol_ma else np.nan
+    c3.metric("Volume Ratio", f"{vol_ratio:.2f}x")
+
+    st.write("**Signals:** " + (" â€¢ ".join(latest_signals) if latest_signals else "Not enough data"))
+else:
+    st.error("Live market data could not be loaded. Refresh the page and check the app logs if this persists.")
+
+st.divider()
 st.info(
-    "The next module should ingest timestamped crypto news and score each headline "
-    "for catalyst strength and sentiment. Keep historical news timestamps separate "
-    "from future price data so the backtest cannot look into the future."
+    "âš ï¸ This is a research/paper-trading tool. A high Radar Score is not a promise that a coin will pump. "
+    "Before using real money, we should add historical backtesting, scam/rug checks, liquidity, news, "
+    "on-chain activity, and proper risk management."
 )
 
-st.subheader("🧪 Backtesting")
-st.write("Run `python backtest.py` after downloading historical data with `python download_data.py`.")
-st.write("The backtester uses chronological train/test splits and reports return, drawdown, "
-         "Sharpe-like ratio, trade count, win rate and profit factor.")
+if st.button("ðŸ”„ Refresh data"):
+    st.cache_data.clear()
+    st.rerun()

@@ -1,116 +1,79 @@
-# ⚡ Crypto Radar AI — starter project
+Crypto Radar AI V100 — Complete Low-Budget Build
 
-This is a research/paper-trading starter, not an automated money-making system.
+This build combines the V4 foundation into one research dashboard with a much broader public-data intelligence stack.
 
-## 1. Put the files in one folder
 
-```text
-crypto_radar/
-  app.py
-  backtest.py
-  download_data.py
-  news.py
-  requirements.txt
-  data/
-```
+Included
 
-## 2. Install Python
 
-Use Python 3.11 or newer.
+CoinGecko market universe
 
-## 3. Open a terminal in the `crypto_radar` folder
+Coinbase 15m/1h/4h/1D candles
 
-Windows:
-```bash
-cd path\to\crypto_radar
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-```
+Binance / Bybit / OKX spot cross-checks and candles
 
-Mac/Linux:
-```bash
-cd path/to/crypto_radar
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
+Coinbase order book + recent trade flow
 
-## 4. Download historical data
+Binance + Bybit derivatives
 
-```bash
-python download_data.py
-```
+DEX Screener liquidity context
 
-This downloads hourly candles for BTC, ETH, SOL, BNB, XRP and DOGE from Binance and puts CSV files in `data/`.
+DefiLlama protocol context
 
-## 5. Run the backtests
+RSS news + optional CryptoPanic adapter
 
-```bash
-python backtest.py
-```
+Fear & Greed index
 
-It performs:
-- a chronological 70/30 train/test split
-- parameter search on the training period
-- untouched out-of-sample testing
-- fees and slippage
-- maximum drawdown
-- win rate
-- profit factor
-- Sharpe-like statistic
+Tokenomics / FDV dilution context
 
-Do NOT optimize parameters using the test period.
+GoPlus security adapter when a contract address is supplied
 
-## 6. Start the website
+Historical analog engine
 
-```bash
-streamlit run app.py
-```
+Walk-forward ML experiment
 
-Your browser will open a local address such as:
-http://localhost:8501
+Simple walk-forward research backtest
 
-## 7. Put it online
+Multi-timeframe alignment
 
-Create a GitHub repository and upload these files. Then use Streamlit Community Cloud:
-https://share.streamlit.io/
+BTC/ETH market regime
 
-Choose:
-- repository
-- branch: main
-- main file: app.py
+Cross-exchange price agreement
 
-The resulting site will be on a `streamlit.app` subdomain.
+Knowledge graph visualization
 
-## 8. Next development stage
+Decision engine: STRONG LONG / LONG / WATCH / NO TRADE / SHORT / STRONG SHORT
 
-Add:
-- CoinGecko news
-- historical timestamped news dataset
-- AI sentiment/catalyst scoring
-- whale/on-chain data
-- DEX liquidity
-- token-unlock calendar
-- rug/scam checks
-- paper trading ledger
-- alert system
-- walk-forward model selection
-- Monte Carlo trade-sequence tests
+Entry reference, invalidation and target levels
 
-## Critical backtesting rule
+Paper prediction ledger
 
-A prediction is only useful if it is reproducible without future information.
+SQLite observation store
 
-For example:
+Coverage/diagnostic panel
 
-BAD:
-- calculate today's final score
-- look at today's closing price
-- call that a successful prediction
 
-GOOD:
-- calculate score at 10:00
-- enter at 10:01/next bar
-- freeze the information set
-- evaluate only what happened afterward
+Important limitations
+
+This is not a guaranteed pump predictor. Probabilities are experimental until calibrated across a large, clean, out-of-sample dataset. Public APIs can rate-limit, change schema, or fail. Some professional on-chain, smart-money, unlock and social data requires paid/API-key providers.
+
+
+Deploy
+
+
+Upload app.py, requirements.txt, .gitignore, and secrets.toml.example to your GitHub repo.
+
+Streamlit Community Cloud -> Create app -> select the repo, branch main, and app.py.
+
+If using keys, put them into Streamlit Secrets, not GitHub.
+
+Deploy.
+
+
+No local Python is required for deployment.
+
+
+Budget strategy
+
+Keep the INR 5,000 untouched until the free stack is measured. Only pay for a data source after we identify a measurable bottleneck.
+

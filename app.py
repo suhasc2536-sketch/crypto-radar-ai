@@ -1,427 +1,391 @@
-import streamlit as st
-import pandas as pd
+import sqlite3
+from pathlib import Path
+
 import numpy as np
+import pandas as pd
 import requests
-import plotly.graph_objects as go
+import streamlit as st
 
-COINBASE_BASE = "https://api.exchange.coinbase.com"
+COINGECKO_BASE = "https://api.coingecko.com/api/v3"
+DEXSCREENER_BASE = "https://api.dexscreener.com"
+DEFILLAMA_BASE = "https://api.llama.fi"
+DB = Path("radar.sqlite")
 
-PRODUCTS = {
-    "BTC-USD": "Bitcoin",
-    "ETH-USD": "Ethereum",
-    "SOL-USD": "Solana",
-    "DOGE-USD": "Dogecoin",
-}
-
-st.set_page_config(
-    page_title="Crypto Radar AI",
-    layout="wide",
-)
-
-st.title("Crypto Radar AI")
-st.caption(
-    "Research dashboard - experimental signals only. "
-    "A high score is not a guarantee of a future price increase."
-)
+st.set_page_config(page_title="Crypto Radar AI V3", layout="wide")
 
 
-@st.cache_data(ttl=60)
-def get_ticker(product_id):
-    url = f"{COINBASE_BASE}/products/{product_id}/ticker"
-    response = requests.get(
-        url,
-        timeout=15,
-        headers={"User-Agent": "CryptoRadarAI/1.0"},
-    )
-    response.raise_for_status()
-    data = response.json()
-
-    price = float(data["price"])
-    base_volume_24h = float(data["volume"])
-
-    return {
-        "price": price,
-        "base_volume_24h": base_volume_24h,
-        "usd_volume_24h": price * base_volume_24h,
-    }
+def init_db():
+    with sqlite3.connect(DB) as conn:
+        conn.execute(""" CREATE TABLE IF NOT EXISTS scans ( id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT DEFAULT CURRENT_TIMESTAMP, payload TEXT NOT NULL ) """)
 
 
-@st.cache_data(ttl=60)
-def get_candles(product_id, granularity=3600):
-    url = f"{COINBASE_BASE}/products/{product_id}/candles"
-    params = {
-        "granularity": granularity,
-    }
-
-    response = requests.get(
-        url,
-        params=params,
-        timeout=15,
-        headers={"User-Agent": "CryptoRadarAI/1.0"},
-    )
-    response.raise_for_status()
-
-    rows = response.json()
-
-    if not rows:
-        return pd.DataFrame()
-
-    # Coinbase returns:
-    # [timestamp, low, high, open, close, volume]
-    df = pd.DataFrame(
-        rows,
-        columns=[
-            "timestamp",
-            "low",
-            "high",
-            "open",
-            "close",
-            "volume",
-        ],
-    )
-
-    for column in ["low", "high", "open", "close", "volume"]:
-        df[column] = pd.to_numeric(df[column], errors="coerce")
-
-    df["timestamp"] = pd.to_datetime(
-        df["timestamp"],
-        unit="s",
-        utc=True,
-    )
-
-    df = df.dropna().sort_values("timestamp").reset_index(drop=True)
-
-    return df
+def save_scan(df):
+    if df is None or df.empty:
+        return
+    payload = df.head(100).to_json(orient="records")
+    with sqlite3.connect(DB) as conn:
+        conn.execute("INSERT INTO scans(payload) VALUES (?)", (payload,))
 
 
-def calculate_rsi(series, period=14):
-    delta = series.diff()
-
-    gains = delta.clip(lower=0)
-    losses = -delta.clip(upper=0)
-
-    avg_gain = gains.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period,
-    ).mean()
-
-    avg_loss = losses.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period,
-    ).mean()
-
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-
-    rsi = 100 - (100 / (1 + rs))
-
-    return rsi.fillna(50)
-
-
-def analyze(df):
-    if len(df) < 60:
-        return {
-            "score": 0,
-            "signals": ["Not enough historical candles"],
-            "rsi": np.nan,
-            "volume_ratio": np.nan,
-            "breakout": False,
-            "ema_bullish": False,
+@st.cache_data(ttl=120)
+def load_market_universe(per_page=100):
+    rows = []
+    pages = (per_page + 249) // 250
+    for page in range(1, pages + 1):
+        size = min(250, per_page - len(rows))
+        if size <= 0:
+            break
+        params = {
+            "vs_currency": "usd",
+            "order": "market_cap_desc",
+            "per_page": size,
+            "page": page,
+            "sparkline": "false",
+            "price_change_percentage": "1h,24h,7d",
         }
+        r = requests.get(
+            f"{COINGECKO_BASE}/coins/markets",
+            params=params,
+            timeout=20,
+            headers={"User-Agent": "CryptoRadarAI/3.0"},
+        )
+        r.raise_for_status()
+        batch = r.json()
+        if not batch:
+            break
+        rows.extend(batch)
 
-    data = df.copy()
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
 
-    data["ema12"] = data["close"].ewm(
-        span=12,
-        adjust=False,
-    ).mean()
-
-    data["ema26"] = data["close"].ewm(
-        span=26,
-        adjust=False,
-    ).mean()
-
-    data["rsi"] = calculate_rsi(data["close"])
-
-    # Compare the latest hourly volume with the previous 24-hour
-    # average volume.
-    data["volume_avg_24"] = (
-        data["volume"]
-        .rolling(24)
-        .mean()
-        .shift(1)
-    )
-
-    data["volume_ratio"] = (
-        data["volume"] / data["volume_avg_24"]
-    )
-
-    # Breakout means the latest close is above the highest close
-    # seen during the previous 48 hourly candles.
-    data["previous_48_high"] = (
-        data["close"]
-        .rolling(48)
-        .max()
-        .shift(1)
-    )
-
-    latest = data.iloc[-1]
-
-    score = 0
-    signals = []
-
-    ema_bullish = latest["ema12"] > latest["ema26"]
-    rsi_value = float(latest["rsi"])
-    volume_ratio = float(latest["volume_ratio"])
-
-    if ema_bullish:
-        score += 30
-        signals.append("Bullish EMA trend")
-    else:
-        signals.append("EMA trend is not bullish")
-
-    if 50 <= rsi_value < 70:
-        score += 20
-        signals.append("RSI supports momentum")
-    elif 70 <= rsi_value < 80:
-        score += 10
-        signals.append("RSI is strong but becoming extended")
-    elif rsi_value < 30:
-        score += 5
-        signals.append("RSI is oversold")
-    else:
-        signals.append("RSI is not in the preferred zone")
-
-    if volume_ratio >= 1.50:
-        score += 25
-        signals.append("Strong volume expansion")
-    elif volume_ratio >= 1.15:
-        score += 12
-        signals.append("Moderate volume expansion")
-    else:
-        signals.append("No meaningful volume expansion")
-
-    breakout = (
-        pd.notna(latest["previous_48_high"])
-        and latest["close"] > latest["previous_48_high"]
-    )
-
-    if breakout:
-        score += 25
-        signals.append("48-hour breakout")
-    else:
-        signals.append("No 48-hour breakout")
-
-    return {
-        "score": int(score),
-        "signals": signals,
-        "rsi": rsi_value,
-        "volume_ratio": volume_ratio,
-        "breakout": bool(breakout),
-        "ema_bullish": bool(ema_bullish),
+    rename = {
+        "current_price": "price",
+        "total_volume": "volume_24h",
+        "price_change_percentage_1h_in_currency": "change_1h",
+        "price_change_percentage_24h_in_currency": "change_24h",
+        "price_change_percentage_7d_in_currency": "change_7d",
     }
+    df = df.rename(columns=rename)
+    wanted = [
+        "id", "symbol", "name", "market_cap_rank", "price",
+        "market_cap", "fully_diluted_valuation", "volume_24h",
+        "change_1h", "change_24h", "change_7d",
+        "circulating_supply", "total_supply", "max_supply",
+        "ath_change_percentage", "atl_change_percentage",
+        "last_updated",
+    ]
+    return df[[c for c in wanted if c in df.columns]]
 
 
-def format_price(price):
-    if price >= 1000:
-        return f"${price:,.0f}"
-    if price >= 1:
-        return f"${price:,.2f}"
-    return f"${price:,.5f}"
+def clip(x, lo=0, hi=100):
+    return max(lo, min(hi, float(x)))
 
 
-def format_usd(value):
-    if value >= 1_000_000_000:
-        return f"${value / 1_000_000_000:.2f}B"
-    if value >= 1_000_000:
-        return f"${value / 1_000_000:.2f}M"
-    if value >= 1_000:
-        return f"${value / 1_000:.2f}K"
-    return f"${value:,.0f}"
+def score_single_asset(asset):
+    score = 0.0
+    reasons = []
 
+    c1 = float(asset.get("change_1h") or 0)
+    c24 = float(asset.get("change_24h") or 0)
+    c7 = float(asset.get("change_7d") or 0)
+    vol = float(asset.get("volume_24h") or 0)
+    mcap = float(asset.get("market_cap") or 0)
 
-# -------------------------------------------------------------------
-# Market overview
-# -------------------------------------------------------------------
+    if c1 > 0:
+        score += 8
+        reasons.append("Positive 1h momentum")
+    if c24 > 2:
+        score += 12
+        reasons.append("Positive 24h momentum")
+    elif c24 < -5:
+        score -= 8
+        reasons.append("Strong 24h weakness")
 
-st.subheader("Market overview")
+    if c7 > 5:
+        score += 10
+        reasons.append("Positive 7d trend")
+    elif c7 < -10:
+        score -= 6
+        reasons.append("Weak 7d trend")
 
-overview_rows = []
+    turnover = vol / mcap if mcap > 0 else 0
+    if turnover >= 0.20:
+        score += 12
+        reasons.append("High daily turnover relative to market cap")
+    elif turnover >= 0.08:
+        score += 6
+        reasons.append("Healthy daily turnover")
 
-for product_id, name in PRODUCTS.items():
-    try:
-        ticker = get_ticker(product_id)
-        candles = get_candles(product_id)
-        analysis = analyze(candles)
+    if mcap >= 10_000_000_000:
+        score += 8
+        reasons.append("Very large market-cap/liquidity universe")
+    elif mcap >= 1_000_000_000:
+        score += 5
+        reasons.append("Large market-cap universe")
+    elif mcap < 50_000_000:
+        score -= 8
+        reasons.append("Small-cap risk")
 
-        price = ticker["price"]
+    if c24 > 30:
+        score -= 8
+        reasons.append("Extreme 24h move increases reversal risk")
 
-        if len(candles) >= 25:
-            old_price = float(candles.iloc[-25]["close"])
-            change_24h = ((price / old_price) - 1) * 100
-        else:
-            change_24h = np.nan
-
-        overview_rows.append(
-            {
-                "Asset": name,
-                "Market": product_id,
-                "Price": format_price(price),
-                "24h Change": (
-                    f"{change_24h:+.2f}%"
-                    if pd.notna(change_24h)
-                    else "N/A"
-                ),
-                "24h USD Volume": format_usd(
-                    ticker["usd_volume_24h"]
-                ),
-                "Radar Score": analysis["score"],
-            }
-        )
-
-    except Exception as exc:
-        overview_rows.append(
-            {
-                "Asset": name,
-                "Market": product_id,
-                "Price": "Error",
-                "24h Change": "Error",
-                "24h USD Volume": "Error",
-                "Radar Score": 0,
-            }
-        )
-
-overview_df = pd.DataFrame(overview_rows)
-
-st.dataframe(
-    overview_df,
-    use_container_width=True,
-    hide_index=True,
-)
-
-st.caption(
-    "Data source: Coinbase public market-data API. "
-    "Volume is converted to approximate USD notional using the latest price."
-)
-
-
-# -------------------------------------------------------------------
-# Detailed analysis
-# -------------------------------------------------------------------
-
-st.subheader("Detailed analysis")
-
-selected_product = st.selectbox(
-    "Select an asset",
-    list(PRODUCTS.keys()),
-    format_func=lambda x: f"{PRODUCTS[x]} ({x})",
-)
-
-try:
-    ticker = get_ticker(selected_product)
-    candles = get_candles(selected_product)
-    analysis = analyze(candles)
-
-    if candles.empty:
-        st.error("No candle data was returned.")
-        st.stop()
-
-    current_price = ticker["price"]
-
-    col1, col2, col3, col4 = st.columns(4)
-
-    with col1:
-        st.metric(
-            "Current price",
-            format_price(current_price),
-        )
-
-    with col2:
-        rsi_display = (
-            f"{analysis['rsi']:.1f}"
-            if pd.notna(analysis["rsi"])
-            else "N/A"
-        )
-        st.metric("RSI", rsi_display)
-
-    with col3:
-        volume_display = (
-            f"{analysis['volume_ratio']:.2f}x"
-            if pd.notna(analysis["volume_ratio"])
-            else "N/A"
-        )
-        st.metric("Volume vs 24h avg", volume_display)
-
-    with col4:
-        st.metric(
-            "Radar Score",
-            f"{analysis['score']}/100",
-        )
-
-    # Candlestick chart
-    chart_data = candles.tail(120)
-
-    fig = go.Figure(
-        data=[
-            go.Candlestick(
-                x=chart_data["timestamp"],
-                open=chart_data["open"],
-                high=chart_data["high"],
-                low=chart_data["low"],
-                close=chart_data["close"],
-                name=selected_product,
-            )
+    available = sum(
+        pd.notna(asset.get(k))
+        for k in [
+            "price", "market_cap", "volume_24h",
+            "change_1h", "change_24h", "change_7d"
         ]
     )
+    confidence = min(clip(40 + available * 10), 65)
 
-    fig.update_layout(
-        height=520,
-        xaxis_title="Time (UTC)",
-        yaxis_title="Price",
-        xaxis_rangeslider_visible=False,
-        margin=dict(l=20, r=20, t=20, b=20),
+    if mcap < 100_000_000 or vol < 5_000_000:
+        risk = "High"
+    elif mcap < 1_000_000_000 or turnover < 0.03:
+        risk = "Medium"
+    else:
+        risk = "Lower"
+
+    return {
+        "opportunity_score": round(clip(score + 50)),
+        "confidence": round(confidence),
+        "risk_level": risk,
+        "reasons": reasons[:8] or ["Insufficient evidence"],
+    }
+
+
+def score_market_dataframe(df, min_market_cap, min_volume):
+    if df.empty:
+        return df
+
+    x = df[
+        (df["market_cap"].fillna(0) >= min_market_cap)
+        & (df["volume_24h"].fillna(0) >= min_volume)
+    ].copy()
+
+    results = x.apply(lambda row: score_single_asset(row.to_dict()), axis=1)
+    x["opportunity_score"] = results.map(lambda r: r["opportunity_score"])
+    x["risk_level"] = results.map(lambda r: r["risk_level"])
+    x["confidence"] = results.map(lambda r: r["confidence"])
+    x["score_reasons"] = results.map(lambda r: " | ".join(r["reasons"]))
+
+    x = x.sort_values(
+        ["opportunity_score", "confidence"],
+        ascending=False
+    ).reset_index(drop=True)
+    x["rank"] = range(1, len(x) + 1)
+    return x
+
+
+def get_dex_snapshot(symbol="", name=""):
+    query = symbol or name
+    r = requests.get(
+        f"{DEXSCREENER_BASE}/latest/dex/search",
+        params={"q": query},
+        timeout=15,
+        headers={"User-Agent": "CryptoRadarAI/3.0"},
+    )
+    r.raise_for_status()
+    pairs = (r.json().get("pairs") or [])[:20]
+
+    clean = []
+    for p in pairs:
+        clean.append({
+            "chain": p.get("chainId"),
+            "dex": p.get("dexId"),
+            "pair": p.get("pairAddress"),
+            "price_usd": p.get("priceUsd"),
+            "liquidity_usd": (p.get("liquidity") or {}).get("usd"),
+            "fdv": p.get("fdv"),
+            "market_cap": p.get("marketCap"),
+            "volume": p.get("volume"),
+            "price_change": p.get("priceChange"),
+            "transactions": p.get("txns"),
+            "pair_created_at": p.get("pairCreatedAt"),
+            "url": p.get("url"),
+            "boosts": p.get("boosts"),
+        })
+    return {"query": query, "pairs": clean}
+
+
+def get_protocol_snapshot(name):
+    r = requests.get(
+        f"{DEFILLAMA_BASE}/protocols",
+        timeout=20,
+        headers={"User-Agent": "CryptoRadarAI/3.0"},
+    )
+    r.raise_for_status()
+    protocols = r.json()
+    target = name.lower()
+    matches = [
+        p for p in protocols
+        if target in str(p.get("name", "")).lower()
+    ][:10]
+
+    return {
+        "query": name,
+        "matches": [
+            {
+                "name": p.get("name"),
+                "symbol": p.get("symbol"),
+                "category": p.get("category"),
+                "tvl": p.get("tvl"),
+                "chainTvls": p.get("chainTvls"),
+                "url": p.get("url"),
+            }
+            for p in matches
+        ],
+    }
+
+
+init_db()
+
+st.title("Crypto Radar AI V3")
+st.caption(
+    "Multi-source crypto market intelligence. Research signals only; "
+    "not guaranteed predictions or financial advice."
+)
+
+with st.sidebar:
+    st.header("Scanner")
+    universe_size = st.selectbox(
+        "Universe size",
+        [100, 250, 500],
+        index=0,
+        help="Larger scans use more API requests and may be slower.",
+    )
+    min_market_cap = st.number_input(
+        "Minimum market cap (USD)",
+        min_value=0,
+        value=10_000_000,
+        step=1_000_000,
+    )
+    min_volume = st.number_input(
+        "Minimum 24h volume (USD)",
+        min_value=0,
+        value=1_000_000,
+        step=100_000,
+    )
+    if st.button("Refresh market scan"):
+        st.cache_data.clear()
+        st.rerun()
+
+st.subheader("1. Full-market scanner")
+
+ranked = pd.DataFrame()
+
+try:
+    market = load_market_universe(per_page=universe_size)
+    ranked = score_market_dataframe(
+        market,
+        min_market_cap=min_market_cap,
+        min_volume=min_volume,
     )
 
-    st.plotly_chart(
-        fig,
+    st.metric("Assets scanned", f"{len(ranked):,}")
+
+    display_cols = [
+        "rank", "name", "symbol", "price", "market_cap",
+        "volume_24h", "change_1h", "change_24h", "change_7d",
+        "opportunity_score", "risk_level", "confidence",
+    ]
+    table = ranked[[c for c in display_cols if c in ranked.columns]].copy()
+
+    for col in ["price", "market_cap", "volume_24h"]:
+        if col in table.columns:
+            table[col] = table[col].map(
+                lambda x: (
+                    f"${x:,.2f}" if pd.notna(x) and x < 1000
+                    else f"${x:,.0f}" if pd.notna(x)
+                    else "N/A"
+                )
+            )
+
+    for col in ["change_1h", "change_24h", "change_7d"]:
+        if col in table.columns:
+            table[col] = table[col].map(
+                lambda x: f"{x:+.2f}%" if pd.notna(x) else "N/A"
+            )
+
+    st.dataframe(table, use_container_width=True, hide_index=True)
+
+    st.subheader("Top opportunities")
+    st.dataframe(
+        ranked.head(20)[
+            [
+                "name", "symbol", "opportunity_score",
+                "risk_level", "confidence", "score_reasons"
+            ]
+        ],
         use_container_width=True,
+        hide_index=True,
     )
-
-    st.subheader("Why the score is what it is")
-
-    for signal in analysis["signals"]:
-        st.write(f"- {signal}")
-
-    st.info(
-        "Score construction: EMA trend 30 points, RSI 20 points, "
-        "volume expansion 25 points, and 48-hour breakout 25 points. "
-        "This is a transparent rule-based research model, not a "
-        "guarantee or financial advice."
-    )
-
-except requests.RequestException as exc:
-    st.error(
-        "The market-data provider could not be reached right now."
-    )
-    st.code(str(exc))
+    save_scan(ranked)
 
 except Exception as exc:
-    st.error("The dashboard encountered an unexpected error.")
+    st.error("The market scan failed.")
     st.code(str(exc))
-
-
-# -------------------------------------------------------------------
-# Controls
-# -------------------------------------------------------------------
-
-if st.button("Refresh market data"):
-    st.cache_data.clear()
-    st.rerun()
+    st.info(
+        "The scanner is designed to degrade gracefully when a public provider "
+        "rate-limits or becomes temporarily unavailable."
+    )
 
 st.divider()
+st.subheader("2. Deep asset analysis")
 
+if not ranked.empty:
+    choices = ranked["id"].tolist()
+    selected_id = st.selectbox(
+        "Choose an asset",
+        choices,
+        format_func=lambda x: (
+            f"{ranked.loc[ranked['id'] == x, 'name'].iloc[0]} "
+            f"({ranked.loc[ranked['id'] == x, 'symbol'].iloc[0].upper()})"
+        ),
+    )
+
+    asset = ranked[ranked["id"] == selected_id].iloc[0].to_dict()
+    detail = score_single_asset(asset)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Opportunity", f"{detail['opportunity_score']}/100")
+    c2.metric("Confidence", f"{detail['confidence']}/100")
+    c3.metric("Risk", detail["risk_level"])
+    c4.metric("24h change", f"{asset.get('change_24h', 0):+.2f}%")
+
+    st.write("### Evidence")
+    for item in detail["reasons"]:
+        st.write(f"- {item}")
+
+    st.write("### Data coverage")
+    coverage = pd.DataFrame(
+        [
+            ["Market data", "CoinGecko", "Available"],
+            ["DEX liquidity / pairs", "DEX Screener", "On-demand"],
+            ["DeFi fundamentals", "DefiLlama", "On-demand"],
+            ["Derivatives", "Exchange adapters", "Next module"],
+            ["On-chain wallets", "Chain adapters", "Next module"],
+            ["News / catalysts", "News adapters", "Next module"],
+        ],
+        columns=["Category", "Primary source", "Status"],
+    )
+    st.dataframe(coverage, use_container_width=True, hide_index=True)
+
+    if st.button("Load DEX snapshot for selected asset"):
+        try:
+            st.json(get_dex_snapshot(asset["symbol"], asset["name"]))
+        except Exception as exc:
+            st.error(f"DEX lookup failed: {exc}")
+
+    if st.button("Search DeFi fundamentals"):
+        try:
+            st.json(get_protocol_snapshot(asset["name"]))
+        except Exception as exc:
+            st.error(f"DeFi lookup failed: {exc}")
+
+st.divider()
 st.caption(
-    "Research and paper-trading tool. Do not connect a wallet or "
-    "place real trades based only on this score."
-)
+    "V3 is intentionally probability-first: collect evidence, normalize it, "
+    "backtest it, and only then allow machine learning to influence probabilities."
+            )

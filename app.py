@@ -46,15 +46,7 @@ def request_json(url, params=None, timeout=20):
 
 def init_db():
     with sqlite3.connect(DB) as con:
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS observations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_at TEXT NOT NULL,
-                asset TEXT NOT NULL,
-                timeframe TEXT,
-                payload TEXT NOT NULL
-            )
-        """)
+        con.execute(""" CREATE TABLE IF NOT EXISTS observations ( id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, asset TEXT NOT NULL, timeframe TEXT, payload TEXT NOT NULL ) """)
 
 
 def save_observation(asset, timeframe, payload):
@@ -617,4 +609,246 @@ except Exception as e:
     universe = pd.DataFrame()
 
 if not universe.empty:
-    # Lightweight market ranking
+    # Lightweight market ranking before expensive deep analysis.
+    universe["turnover"] = universe["volume_24h"] / universe["market_cap"].replace(0, np.nan)
+    universe["quick_score"] = (
+        50
+        + np.clip(universe["change_24h"].fillna(0) * 1.5, -15, 15)
+        + np.clip(universe["change_7d"].fillna(0) * 0.7, -10, 10)
+        + np.clip(universe["turnover"].fillna(0) * 50, 0, 12)
+    )
+    universe["quick_score"] = universe["quick_score"].clip(0, 100)
+    universe = universe.sort_values("quick_score", ascending=False).reset_index(drop=True)
+
+    show = universe[[
+        "market_cap_rank", "name", "symbol", "price",
+        "market_cap", "volume_24h", "change_24h", "change_7d", "quick_score"
+    ]].head(50)
+    st.dataframe(show, use_container_width=True, hide_index=True)
+
+    st.subheader("2. Deep evidence analysis")
+
+    options = universe["id"].tolist()
+    selected = st.selectbox(
+        "Select asset",
+        options,
+        format_func=lambda x: (
+            f"{universe.loc[universe.id == x, 'name'].iloc[0]} "
+            f"({universe.loc[universe.id == x, 'symbol'].iloc[0].upper()})"
+        ),
+    )
+
+    row = universe[universe.id == selected].iloc[0]
+    symbol = str(row["symbol"]).upper()
+    name = str(row["name"])
+
+    # Coinbase mapping for spot analysis. More mappings can be added later.
+    cb_product = f"{symbol}-USD"
+
+    tf_tabs = st.tabs(["5m", "15m", "1h", "4h", "1D"])
+    technical_latest = {}
+
+    for tab, tf in zip(tf_tabs, ["5m", "15m", "1h", "4h", "1D"]):
+        with tab:
+            try:
+                candles = coinbase_candles(cb_product, tf, 300)
+                if candles.empty or len(candles) < 60:
+                    st.warning(f"Not enough Coinbase candles for {cb_product} on {tf}.")
+                    continue
+
+                tech = enrich_technicals(candles)
+                lf = latest_features(tech)
+                technical_latest[tf] = lf
+
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("Price", f"${lf['close']:,.4f}")
+                c2.metric("RSI", f"{lf['rsi14']:.1f}")
+                c3.metric("Volume ratio", f"{lf['volume_ratio']:.2f}x")
+                c4.metric("ADX", f"{lf['adx14']:.1f}")
+                c5.metric("ATR", f"{lf['atr_pct']:.2f}%")
+
+                st.dataframe(
+                    tech.tail(80)[[
+                        "timestamp", "close", "volume", "rsi14",
+                        "ema_spread", "adx14", "volume_ratio", "breakout20"
+                    ]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            except Exception as e:
+                st.warning(f"{tf} analysis unavailable: {e}")
+
+    st.markdown("### Cross-timeframe structure")
+    if technical_latest:
+        rows = []
+        for tf, f in technical_latest.items():
+            rows.append({
+                "timeframe": tf,
+                "RSI": f.get("rsi14"),
+                "ADX": f.get("adx14"),
+                "EMA20/50 spread %": f.get("ema_spread", np.nan) * 100,
+                "Volume ratio": f.get("volume_ratio"),
+                "20-bar breakout %": f.get("breakout20", np.nan) * 100,
+                "Return 6 bars %": f.get("ret6", np.nan) * 100,
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    st.markdown("### Evidence stack")
+
+    # Use 1h as primary horizon.
+    try:
+        primary = enrich_technicals(coinbase_candles(cb_product, "1h", 300))
+        tscore, treasons = technical_evidence(latest_features(primary))
+    except Exception:
+        primary = pd.DataFrame()
+        tscore, treasons = 50, ["Technical evidence unavailable"]
+
+    try:
+        book = book_metrics(coinbase_book(cb_product))
+        flow = trade_flow_metrics(coinbase_trades(cb_product))
+        mscore, mreasons = microstructure_evidence(book, flow)
+    except Exception:
+        book, flow = {}, {}
+        mscore, mreasons = 50, ["Spot microstructure unavailable"]
+
+    try:
+        deriv = binance_derivatives(symbol)
+        dscore, dreasons = derivative_evidence(deriv)
+    except Exception:
+        deriv = {"available": False}
+        dscore, dreasons = 50, ["Derivatives unavailable"]
+
+    try:
+        analog = historical_analog_probability(primary, horizon_bars=24, k=40)
+    except Exception:
+        analog = {"p_up5": np.nan, "p_down5": np.nan, "sample": 0, "mean_future": np.nan}
+
+    try:
+        dex_df = dex_search(symbol, name)
+    except Exception:
+        dex_df = pd.DataFrame()
+
+    try:
+        llama = llama_protocol(name)
+    except Exception:
+        llama = []
+
+    p_up, p_down = fuse_probability(tscore, dscore, mscore, analog)
+
+    # Confidence is explicitly limited by evidence coverage.
+    available = sum([
+        not primary.empty,
+        bool(book),
+        bool(flow),
+        deriv.get("available", False),
+        not dex_df.empty,
+        bool(llama),
+        analog.get("sample", 0) >= 20,
+    ])
+    confidence = int(np.clip(30 + available * 9, 30, 82))
+
+    a, b, c, d = st.columns(4)
+    a.metric("24h +5% probability", f"{p_up * 100:.1f}%")
+    b.metric("24h -5% probability", f"{p_down * 100:.1f}%")
+    c.metric("Confidence", f"{confidence}/100")
+    d.metric("Historical analogs", str(analog.get("sample", 0)))
+
+    st.markdown("### Why the engine reached this view")
+
+    reason_sections = [
+        ("Price / technical structure", treasons),
+        ("Spot liquidity / order flow", mreasons),
+        ("Derivatives / positioning", dreasons),
+    ]
+
+    for title, reasons in reason_sections:
+        st.write(f"**{title}**")
+        for r in reasons[:8]:
+            st.write(f"- {r}")
+
+    if np.isfinite(analog.get("p_up5", np.nan)):
+        st.write(
+            f"- Historical analogs: {analog['p_up5'] * 100:.1f}% of the "
+            f"nearest historical states reached +5% within the selected horizon; "
+            f"mean forward return was {analog['mean_future'] * 100:.2f}%."
+        )
+
+    st.markdown("### Derivatives snapshot")
+    if deriv.get("available"):
+        deriv_display = {
+            k: v for k, v in deriv.items()
+            if k not in {"available"} and np.isscalar(v)
+        }
+        st.json(deriv_display)
+    else:
+        st.info(deriv.get("reason", "No derivatives data"))
+
+    st.markdown("### DEX liquidity snapshot")
+    if not dex_df.empty:
+        st.dataframe(
+            dex_df.sort_values("liquidity_usd", ascending=False).head(10),
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.info("No DEX pair data returned for this search.")
+
+    st.markdown("### DeFi fundamentals")
+    if llama:
+        llama_rows = []
+        for p in llama:
+            llama_rows.append({
+                "protocol": p.get("name"),
+                "category": p.get("category"),
+                "TVL": p.get("tvl"),
+                "chains": ", ".join((p.get("chainTvls") or {}).keys()) if isinstance(p.get("chainTvls"), dict) else "",
+                "url": p.get("url"),
+            })
+        st.dataframe(pd.DataFrame(llama_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("No matching DefiLlama protocol was found.")
+
+    save_observation(
+        f"{name}:{symbol}",
+        "1h",
+        {
+            "technical_score": tscore,
+            "micro_score": mscore,
+            "derivative_score": dscore,
+            "p_up_5": p_up,
+            "p_down_5": p_down,
+            "confidence": confidence,
+            "analog_sample": analog.get("sample", 0),
+        },
+    )
+
+    st.warning(
+        "This probability is an experimental research estimate, not a guaranteed "
+        "prediction. It is intentionally capped and should not be used as a trading instruction."
+    )
+
+else:
+    st.info("No assets meet the current market-cap and volume filters.")
+
+st.divider()
+st.markdown("### Current source coverage")
+coverage = pd.DataFrame([
+    ["Market universe", "CoinGecko", "Live public endpoint"],
+    ["Spot candles", "Coinbase Exchange", "Live public endpoint"],
+    ["Spot order book", "Coinbase Exchange", "Live public endpoint"],
+    ["Recent spot trades", "Coinbase Exchange", "Live public endpoint"],
+    ["Derivatives", "Binance Futures", "Public market-data endpoints"],
+    ["DEX liquidity", "DEX Screener", "Public API"],
+    ["DeFi fundamentals", "DefiLlama", "Public API"],
+    ["News / social", "Optional adapters", "Not yet wired"],
+    ["Tokenomics / unlocks", "Optional adapters", "Not yet wired"],
+    ["On-chain wallets / smart money", "Optional adapters", "Usually API-keyed"],
+    ["Security / contract risk", "Optional adapters", "Chain-specific"],
+    ["ML calibration", "Internal", "Requires accumulated labeled history"],
+], columns=["Area", "Source", "Status"])
+st.dataframe(coverage, use_container_width=True, hide_index=True)
+
+st.caption(
+    "V4 deliberately separates evidence from prediction. The next research stage is "
+    "walk-forward backtesting, probability calibration, and additional keyed/public adapters."
+)
